@@ -25,8 +25,10 @@ from geometry_msgs.msg import (
 )
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import (
+    BatteryState,
     Image,
     Imu,
+    JointState,
 )
 from std_msgs.msg import Header
 
@@ -79,14 +81,21 @@ class Cozmo(Client):
                                       namespace=namespace or node_name)
 
         # Variables
-        self._odom_frame = "/map"
-        self._base_frame = "/base_link"
-        self._bridge     = CvBridge()
-        self._last_pose  = Pose()
-        self._imu_msg    = Imu(header = Header(frame_id = self._base_frame))
-        self._odom_msg   = Odometry(header = Header(frame_id = self._odom_frame),
-                                    child_frame_id = self._base_frame,
-                                    pose = PoseWithCovariance())
+        self._odom_frame             = "/map"
+        self._base_frame             = "/base_link"
+        self._bridge                 = CvBridge()
+        self._last_pose              = Pose()
+        self._imu_msg                = Imu(header = Header(frame_id = self._base_frame))
+        self._odom_msg               = Odometry(header = Header(frame_id = self._odom_frame),
+                                                child_frame_id = self._base_frame,
+                                                pose = PoseWithCovariance())
+        self._js_msg                 = JointState()
+        self._js_msg.header.frame_id = self._base_frame
+        self._js_msg.name            = ['head', 'lift']
+        self._js_msg.velocity        = [0.0, 0.0]
+        self._js_msg.effort          = [0.0, 0.0]
+        self._battery_msg            = BatteryState()
+        self._battery_msg.present    = True
         # self._tf_msg     = TransformStamped(header = Header(frame_id = self._odom_frame),
         #                                    child_frame_id = self._base_frame)
 
@@ -94,9 +103,11 @@ class Cozmo(Client):
         self._twist_sub = self.node.create_subscription(Twist, 'cmd_vel', self._control, 10)
 
         # Publishers
-        self._img_pub  = self.node.create_publisher(Image, 'camera', 1)
-        self._imu_pub  = self.node.create_publisher(Imu, 'imu', 1)
-        self._odom_pub = self.node.create_publisher(Odometry, "odom", 1)
+        self._img_pub         = self.node.create_publisher(Image, 'camera', 1)
+        self._imu_pub         = self.node.create_publisher(Imu, 'imu', 1)
+        self._odom_pub        = self.node.create_publisher(Odometry, "odom", 1)
+        self._joint_state_pub = self.node.create_publisher(JointState, 'joints', 1)
+        self._battery_pub     = self.node.create_publisher(BatteryState, 'battery', 1)
         # self._tf_pub   = self.create_publisher(TFMessage, "tf", 10)
 
         self._ros2_started = True
@@ -125,13 +136,15 @@ class Cozmo(Client):
 
         self._pub_imu(now)
         self._pub_odom(now)
+        self._publish_joint_state(now)
+        self._publish_battery(now)
 
     def _pub_odom(self, now):
         """
         Publish imu data as Imu.
 
         """
-        # Publish only ros if there are subscribers:
+        # Publish only if there are subscribers
         if self._odom_pub.get_subscription_count() == 0:
             return
 
@@ -154,7 +167,7 @@ class Cozmo(Client):
         Publish imu data as Imu.
 
         """
-        # Publish only ros if there are subscribers:
+        # Publish only if there are subscribers
         if self._imu_pub.get_subscription_count() == 0:
             return
 
@@ -169,11 +182,99 @@ class Cozmo(Client):
 
         self._imu_pub.publish(self._imu_msg)
 
+    def _publish_joint_state(self, now):
+        """
+        Publish joint states as JointStates.
+
+        """
+        # Publish only if there are subscribers
+        if self._joint_state_pub.get_subscription_count() == 0:
+            return
+
+        self._js_msg.header.stamp = now
+        self._js_msg.position     = [self.head_angle.radians,
+                                     self.lift_position * 0.001]
+        self._joint_state_pub.publish(self._js_msg)
+
+    def _publish_battery(self, now):
+        """
+        Publish battery as BatteryState message.
+
+        """
+        # Publish only if there are subscribers
+        if self._battery_pub.get_subscription_count() == 0:
+            return
+
+        self._battery_msg.header.stamp = now
+        self._battery_msg.voltage      = self.battery_voltage
+        self._battery_pub.publish(self._battery_msg)
+
+    def _robot_charging(self, cli, state):
+        """
+        Publish battery as BatteryState message.
+
+        """
+        del cli
+
+        if self._battery_pub.get_subscription_count() == 0:
+            return
+
+        now = self.node.get_clock().now().to_msg()
+        self._battery_msg.header.stamp = now
+        if state:
+            self._battery_msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_CHARGING
+        else:
+            self._battery_msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_NOT_CHARGING
+        self._battery_pub.publish(self._battery_msg)
+
+    def _cliff_detection_cb(self, cli, state):
+        del cli
+        if state:
+            self.node.get_logger().info("Cliff detected.")
+
+    def _robot_kidnapping_cb(self, cli, state):
+        del cli
+        if state:
+            self.node.get_logger().info("Picked up.")
+        else:
+            self.node.get_logger().info("Put down.")
+
+    def _robot_poking_cb(self, cli, pkt):
+        # pkt : pycozmo.protocol_encoder.RobotPoked
+        del cli, pkt
+        self.node.get_logger().info("Robot poked.")
+
+    def _robot_falling_cb(self, cli, pkt):
+        del cli
+        if type(pkt) == protocol_encoder.FallingStarted:
+            self.node.get_logger().info("Started falling.")
+        elif type(pkt) == protocol_encoder.FallingStopped:
+            self.node.get_logger().info("Falling stopped after {} ms. Impact intensity {:.01f}.".format(pkt.duration_ms, pkt.impact_intensity))
+        else:
+            pass
+
+    def _button_pressed_cb(self, cli, pkt):
+        del cli
+        if pkt.pressed:
+            self.node.get_logger().info("Button pressed.")
+        else:
+            self.node.get_logger().info("Button released.")
+
+    def _robot_wheels_moving_cb(self, cli, state):
+        del cli
+        if state:
+            self.node.get_logger().info("Started moving.")
+        else:
+            self.node.get_logger().info("Stopped moving.")
+
+
     def _image_cb(self, cli, img):
         """
         Publish camera image as Image.
 
         """
+        del cli
+
         # Publish only if ROS2 is started and there are subscribers
         if not self._ros2_started or self._img_pub.get_subscription_count() == 0:
             return
@@ -187,8 +288,16 @@ class Cozmo(Client):
         self._img_pub.publish(img_msg)
 
     def _start(self):
-        self.add_handler(event.EvtRobotStateUpdated, self._robot_state_cb)
-        self.add_handler(event.EvtNewRawCameraImage, self._image_cb)
+        self.add_handler(event.EvtRobotStateUpdated,           self._robot_state_cb)
+        self.add_handler(event.EvtNewRawCameraImage,           self._image_cb)
+        self.add_handler(event.EvtRobotChargingChange,         self._robot_charging)
+        self.add_handler(event.EvtRobotPickedUpChange,         self._robot_kidnapping_cb)
+        self.add_handler(event.EvtCliffDetectedChange,         self._cliff_detection_cb)
+        self.add_handler(event.EvtRobotWheelsMovingChange,     self._robot_wheels_moving_cb)
+        self.conn.add_handler(protocol_encoder.RobotPoked,     self._robot_poking_cb)
+        self.conn.add_handler(protocol_encoder.FallingStarted, self._robot_falling_cb)
+        self.conn.add_handler(protocol_encoder.FallingStopped, self._robot_falling_cb)
+        self.conn.add_handler(protocol_encoder.ButtonPressed,  self._button_pressed_cb)
 
     def _control(self, twist_msg):
         """
